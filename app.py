@@ -338,12 +338,7 @@ with tab2:
 
         display_df = df[["id","overall_score","semantic_similarity","llm_judge","tone_score","length_score"]].copy()
         display_df.columns = ["ID","Overall %","Similarity","LLM Judge /10","Tone /10","Length /10"]
-        try:
-            import matplotlib  # noqa: F401 — only needed for background_gradient
-            styled = display_df.style.background_gradient(subset=["Overall %"], cmap="RdYlGn")
-            st.dataframe(styled, use_container_width=True, height=450)
-        except ImportError:
-            st.dataframe(display_df, use_container_width=True, height=450)
+        st.dataframe(display_df, use_container_width=True, height=450)
 
         st.markdown("#### 📈 Score Distribution")
         chart_df = df[["id","overall_score","semantic_similarity"]].set_index("id")
