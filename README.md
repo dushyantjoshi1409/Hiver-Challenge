@@ -31,10 +31,36 @@ This project solves two distinct problems that directly mirror what Hiver does a
 
 | Problem | Solution |
 |---------|----------|
-| **Response Generation** | Given a raw customer email, an LLM generates an empathetic, professional, concise reply using a carefully engineered system prompt |
+| **Dataset** | 25 hand-authored synthetic email/reply pairs covering the most common customer support scenarios for a SaaS company |
+| **Response Generation** | Given a new email, semantically retrieve the top-3 most similar past emails from the dataset, inject them as few-shot examples, then call Llama 3.3 70B to generate a grounded reply |
 | **Response Evaluation** | Each generated reply is scored across four complementary metrics and combined into a single weighted percentage score |
 
 Both the generator and evaluator are built as standalone scripts (`generate.py`, `evaluate.py`) that are fully runnable end-to-end. A **Streamlit UI** (`app.py`) lets you generate and evaluate replies live in a browser.
+
+---
+
+## Dataset
+
+### Source & Construction
+
+The dataset (`emails.csv`) contains **25 synthetic customer support email/reply pairs**, hand-authored to be representative of real SaaS customer interactions.
+
+**Why synthetic?** Real customer support emails contain PII (names, order numbers, account details) and are proprietary. Synthetic data lets us control coverage, avoid privacy issues, and ensure the dataset is shareable in a public repository.
+
+**Why representative?** The 25 scenarios were chosen by mapping to the most frequent customer support request categories in SaaS:
+
+| Category | Examples in dataset |
+|----------|--------------------|
+| Billing & Payments | Double charge, wrong invoice, refund, tax invoice |
+| Subscription Management | Cancel, upgrade, downgrade, loyalty discount |
+| Delivery & Orders | Late order, wrong address, damaged item, missing package |
+| Account & Access | Password reset, deleted account, multi-user setup |
+| Technical Issues | App crash, API integration, slow website |
+| Product & Policy | Data privacy, free trial, data export |
+
+Each reply was written to reflect real support team standards: empathetic opening, clear action, professional tone, 80–180 word target length.
+
+**How AI tools were used in dataset creation:** Scenario topics were brainstormed with ChatGPT, but all 25 email/reply pairs were written manually and reviewed for quality, coverage, and realism before being committed.
 
 ---
 
@@ -45,8 +71,17 @@ emails.csv  (25 labelled email/reply pairs)
       │
       ▼
  generate.py
-      │  → system prompt + customer email → Groq API (Llama 3.3 70B)
-      │  → JSON response parsed → stored per row
+      │
+      ├── 1. Embed all 25 emails with all-MiniLM-L6-v2
+      │
+      ├── 2. For each target email:
+      │        → compute cosine similarity to all other emails
+      │        → retrieve top-3 most similar past pairs (excluding self)
+      │        → build few-shot prompt block with those 3 examples
+      │
+      └── 3. Call Groq / Llama 3.3 70B with:
+               system prompt + few-shot examples + target email
+               → JSON response parsed → stored per row
       ▼
  generated.csv  (customer_email | expected_reply | generated_reply)
       │
@@ -75,12 +110,33 @@ emails.csv  (25 labelled email/reply pairs)
 
 ## Prompting Strategy
 
-### Generator Prompt
+### Generation Approach: Semantic Few-Shot Retrieval
 
-The system prompt for reply generation was designed around five principles observed in high-quality customer support:
+The generator does **not** use a generic standalone prompt. Instead, it grounds every reply in the dataset through **semantic few-shot retrieval**:
+
+1. All 25 emails in the dataset are embedded with `all-MiniLM-L6-v2`
+2. For each incoming email, cosine similarity is computed against all other emails in the dataset
+3. The top-3 most similar past email/reply pairs are retrieved
+4. Those 3 pairs are injected into the prompt as concrete few-shot examples
+5. The LLM generates a reply that mirrors the style, tone, and structure of the retrieved examples
+
+**Why this approach over alternatives:**
+
+| Approach | Chosen? | Reason |
+|----------|---------|--------|
+| **Semantic Few-Shot Retrieval** | ✅ Yes | Grounds generation in dataset. Fast, no infra needed, transparent. Works well at 25-example scale. |
+| Full RAG with vector DB (Pinecone, Chroma) | ❌ No | Overkill for 25 examples. Adds infrastructure complexity with no quality gain at this scale. |
+| Fine-tuning | ❌ No | Requires GPU, data labelling pipeline, and retraining cycles. 25 examples is far too few — would overfit badly. |
+| Static few-shot (same examples every time) | ❌ No | Less relevant examples hurt quality. Semantic retrieval ensures the most applicable examples are always chosen. |
+
+### System Prompt
 
 ```
 You are an expert customer support agent for a SaaS company.
+You will be given a few examples of real past customer emails and the replies
+that were sent. Use those examples to learn the correct tone, structure,
+and level of detail — then write a reply for the new email.
+
 Your replies must be:
 - Empathetic and warm — acknowledge the customer's feelings first.
 - Concise — ideally 80–180 words, never more than 250.
@@ -88,14 +144,14 @@ Your replies must be:
 - Action-oriented — always state the next concrete step.
 - Honest — never make promises you can't keep.
 
-Return ONLY a JSON object with a single key "reply" containing the email reply text.
+Return ONLY a JSON object with a single key "reply" containing your email reply.
 ```
 
-Key decisions:
-- **JSON output mode** (`response_format: json_object`) eliminates markdown wrapping and makes parsing deterministic.
-- **Temperature 0.4** — low enough for consistency and professionalism, high enough to avoid repetitive boilerplate phrasing.
-- **Explicit word count target** in the prompt directly steers the model toward the ideal 80–180 word range before any scoring penalty is applied.
-- **Anti-patterns called out explicitly** ("Certainly!", "Of course!") — these filler openers appear frequently in fine-tuned customer support models and reduce the quality perception.
+Key prompt decisions:
+- **JSON output mode** (`response_format: json_object`) makes parsing deterministic, no regex hacks.
+- **Temperature 0.4** — consistent and professional, but not so low it produces repetitive boilerplate.
+- **Anti-patterns called out explicitly** ("Certainly!", "Of course!") — these filler openers are common in support models and reduce quality perception.
+- **Explicit few-shot framing** ("use these examples to learn tone and structure") steers the model to treat the retrieved pairs as style guidance, not just information.
 
 ### LLM Judge Prompt
 
@@ -321,6 +377,23 @@ Sufficient to observe patterns (high-tone consistency, length variance, similari
 
 **Why is the `.env` file not committed?**
 Security best practice. Anyone cloning this repo creates their own `.env` with their own Groq key. The `.gitignore` explicitly excludes `.env`.
+
+---
+
+## How AI Tools Were Used
+
+The challenge asks for transparency on AI tool usage. Here's an honest account:
+
+| Task | Tool Used | How |
+|------|-----------|-----|
+| Scenario brainstorming | ChatGPT | Generated a list of the most common SaaS customer support request types to ensure dataset coverage |
+| Email/reply writing | Human (manual) | All 25 email/reply pairs were written and reviewed by hand. AI suggestions were not used for the actual content |
+| LLM inference (generation) | Groq / Llama 3.3 70B | Core AI for generating email replies at runtime |
+| LLM inference (evaluation) | Groq / Llama 3.3 70B | LLM judge and tone scorer in the evaluation pipeline |
+| Sentence embeddings | all-MiniLM-L6-v2 (local) | Semantic similarity for retrieval and evaluation — runs fully offline |
+| Code assistance | Antigravity (AI coding assistant) | Used for boilerplate, debugging, and code structure — all logic, prompts, and evaluation design are the author's own |
+
+**Bottom line:** The evaluation methodology, prompting strategy, metric weights, and architectural decisions are original work. AI tools were used as productivity accelerators, not as a substitute for thinking.
 
 ---
 
