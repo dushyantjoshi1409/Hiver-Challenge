@@ -16,6 +16,7 @@ import streamlit as st
 from sentence_transformers import SentenceTransformer
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
+from agent import run_agent_for_email
 
 from utils import (
     get_groq_client,
@@ -128,6 +129,14 @@ def load_resources():
     return client, embed
 
 
+@st.cache_resource(show_spinner="Loading dataset…")
+def load_dataset():
+    df   = pd.read_csv("emails.csv")
+    _, embed = load_resources()
+    embs = embed.encode(df["customer_email"].tolist())
+    return df, embs
+
+
 MODEL = "llama-3.3-70b-versatile"
 
 SYSTEM_PROMPT = """You are an expert customer support agent for a SaaS company.
@@ -214,7 +223,7 @@ def score_reply_live(client, embed_model, customer_email: str, generated: str) -
 st.markdown('<div class="hero-title">✉️ Hiver AI — Email Reply Generator</div>', unsafe_allow_html=True)
 st.markdown('<div class="hero-sub">Generates empathetic, professional customer support replies · Evaluates quality with 4 complementary metrics</div>', unsafe_allow_html=True)
 
-tab1, tab2 = st.tabs(["🚀 Live Demo", "📊 Batch Results"])
+tab1, tab2, tab3 = st.tabs(["🚀 Live Demo", "📊 Batch Results", "🤖 Agent Demo"])
 
 # ── Tab 1: Live Demo ──────────────────────────────────────────────────────────
 with tab1:
@@ -343,3 +352,96 @@ with tab2:
         st.markdown("#### 📈 Score Distribution")
         chart_df = df[["id","overall_score","semantic_similarity"]].set_index("id")
         st.line_chart(chart_df, use_container_width=True)
+
+
+# ── Tab 3: Agent Demo ─────────────────────────────────────────────────────────
+with tab3:
+    st.markdown("#### 🤖 Agentic Self-Correcting Reply Generator")
+    st.markdown(
+        "The agent generates a reply, scores it, and — if below **80%** — "
+        "tells itself exactly what was wrong and tries again. Watch it think below."
+    )
+
+    dataset_df, dataset_embeddings = load_dataset()
+
+    agent_email_options = {f"#{r['id']} — {r['customer_email'][:60]}…": i
+                           for i, r in dataset_df.iterrows()}
+    chosen_key = st.selectbox("Pick an email from the dataset", list(agent_email_options.keys()))
+    chosen_idx = agent_email_options[chosen_key]
+    chosen_row = dataset_df.iloc[chosen_idx]
+
+    st.markdown("**Customer Email:**")
+    st.markdown(f'<div class="reply-box">{chosen_row["customer_email"]}</div>', unsafe_allow_html=True)
+    st.markdown("**Gold-standard expected reply:**")
+    st.markdown(f'<div class="reply-box" style="border-color:#334155;opacity:0.7">{chosen_row["expected_reply"]}</div>', unsafe_allow_html=True)
+
+    st.markdown("")
+    run_agent_btn = st.button("🤖 Run Agentic Loop", use_container_width=False)
+
+    if run_agent_btn:
+        client, embed_model = load_resources()
+
+        attempt_log  = []          # filled by callback
+        log_container = st.container()
+
+        def agent_callback(attempt_num, reply, scores, accepted, feedback):
+            attempt_log.append({
+                "num": attempt_num, "reply": reply,
+                "scores": scores, "accepted": accepted,
+                "feedback": feedback,
+            })
+            icon  = "✅" if accepted else "❌"
+            color = "#22c55e" if accepted else "#f59e0b"
+            with log_container:
+                st.markdown(
+                    f"""<div style='border:1px solid {color};border-radius:12px;
+                    padding:1rem 1.2rem;margin-bottom:1rem;background:#1e293b'>
+                    <div style='font-size:1rem;font-weight:700;color:{color};
+                    margin-bottom:0.5rem'>
+                    {icon} Attempt {attempt_num} — Score: {scores['overall']:.1f}%
+                    {'(Accepted ✅)' if accepted else '(Below 80% threshold, retrying…)'}
+                    </div>
+                    <div style='display:flex;gap:1.5rem;font-size:0.85rem;
+                    color:#94a3b8;margin-bottom:0.8rem'>
+                    <span>🧮 Similarity: {scores['similarity']:.3f}</span>
+                    <span>👨‍⚖️ Judge: {scores['judge']}/10</span>
+                    <span>🎭 Tone: {scores['tone']}/10</span>
+                    <span>📏 Length: {scores['length']}/10</span>
+                    </div>
+                    <div style='background:#0f172a;border-radius:8px;
+                    padding:0.8rem;color:#e2e8f0;font-size:0.88rem;
+                    line-height:1.6;white-space:pre-wrap'>{reply}</div>
+                    </div>""",
+                    unsafe_allow_html=True,
+                )
+                if not accepted and feedback:
+                    with st.expander(f"💬 Feedback injected into Attempt {attempt_num+1} prompt"):
+                        st.code(feedback, language="")
+
+        with st.status("🤖 Agent is working…", expanded=True) as agent_status:
+            st.write("Loading resources and computing embeddings…")
+            result = run_agent_for_email(
+                client, embed_model,
+                dataset_df, dataset_embeddings,
+                chosen_row["customer_email"],
+                chosen_row["expected_reply"],
+                row_idx=chosen_idx,
+                progress_callback=agent_callback,
+            )
+            label = (f"✅ Done — accepted after {result['total_attempts']} attempt(s)"
+                     if result['total_attempts'] == 1 or
+                        result['attempts'][-1]['accepted']
+                     else f"⚠️ Done — {result['total_attempts']} attempts, best score kept")
+            agent_status.update(label=label, state="complete", expanded=False)
+
+        st.markdown("---")
+        best_color = "#22c55e" if result['best_score'] >= 80 else "#f59e0b"
+        st.markdown(
+            f"""<div style='text-align:center;padding:1rem'>
+            <div style='color:#94a3b8;font-size:0.85rem'>FINAL SCORE
+            (attempt {result['accepted_at_attempt']} of {result['total_attempts']})</div>
+            <span class='overall-badge'
+            style='background:linear-gradient(135deg,{best_color}88,{best_color})'>
+            {result['best_score']:.1f}%</span></div>""",
+            unsafe_allow_html=True,
+        )
